@@ -21,14 +21,15 @@ import Anthropic from "@anthropic-ai/sdk";
 
 // cheapest available Claude model — explicitly chosen for a free tool
 const CLAUDE_MODEL = "claude-haiku-4-5";
-const CLAUDE_MAX_TOKENS = 1500;    // hard ceiling on output → caps per-call cost
+const CLAUDE_MAX_TOKENS = 3000;    // hard ceiling on output → caps per-call cost
 
 const UA = "MakeLLM/1.0 (+https://makellm.com; llms.txt generator)";
 const FETCH_TIMEOUT = 6000;        // per-request timeout
-const MAX_PAGE_FETCHES = 6;        // how many real pages to fetch for titles/meta
-const MAX_LINKS_PER_SECTION = 8;
-const MAX_SECTIONS = 8;
-const MAX_TOTAL_LINKS = 50;
+const MAX_PAGE_FETCHES = 8;        // how many real pages to fetch for titles/meta
+const MAX_LINKS_PER_SECTION = 12;
+const MAX_SECTIONS = 15;
+const MAX_TOTAL_LINKS = 150;
+const MAX_SITEMAP_URLS = 1500;     // how many sitemap URLs to read before grouping
 
 // ---- tiny fetch helper with timeout --------------------------------------
 async function fetchText(url, { accept } = {}) {
@@ -160,27 +161,27 @@ async function collectSitemapEntries(root) {
   if (!rootXml) return [];
 
   if (looksLikeSitemapIndex(rootXml)) {
-    // child sitemaps — fetch the freshest few, gather their <url> entries.
+    // child sitemaps — fetch the freshest several, gather their <url> entries.
     // Sort children by their own <lastmod> so we crawl recently-updated
     // sections first when the index is larger than we'll read.
     const childEntries = extractEntries(rootXml);
     const children = (childEntries.length ? childEntries : extractLocs(rootXml).map((loc) => ({ loc, lastmod: 0 })))
       .sort((a, b) => b.lastmod - a.lastmod)
-      .slice(0, 5)
+      .slice(0, 12)
       .map((e) => e.loc);
     for (const child of children) {
       const xml = await fetchText(child, { accept: "application/xml,text/xml,*/*" });
       if (!xml) continue;
       for (const e of extractEntries(xml)) {
         add(e);
-        if (entries.length >= 400) break;
+        if (entries.length >= MAX_SITEMAP_URLS) break;
       }
-      if (entries.length >= 400) break;
+      if (entries.length >= MAX_SITEMAP_URLS) break;
     }
   } else {
     for (const e of extractEntries(rootXml)) {
       add(e);
-      if (entries.length >= 400) break;
+      if (entries.length >= MAX_SITEMAP_URLS) break;
     }
   }
   return entries;
@@ -234,6 +235,25 @@ function firstSegment(u) {
   }
 }
 
+// Low-value URLs we drop before grouping so the link budget goes to real
+// content: tag/category/author archives, pagination, feeds, search, and
+// non-page asset files. Keeps the bigger cap high-signal, not noisy.
+const NOISE_SEGMENTS = new Set([
+  "tag", "tags", "category", "categories", "author", "authors",
+  "page", "pages", "feed", "rss", "search", "amp", "print",
+  "wp-content", "wp-json", "cdn-cgi", "comment", "comments",
+]);
+const NOISE_EXT = /\.(xml|json|rss|atom|txt|css|js|png|jpe?g|gif|webp|svg|ico|pdf|zip|gz)$/i;
+function isNoiseUrl(u) {
+  let path;
+  try { path = new URL(u).pathname.toLowerCase(); } catch { return true; }
+  if (NOISE_EXT.test(path)) return true;
+  if (/\/page\/\d+\/?$/.test(path)) return true;        // /blog/page/2
+  const segs = path.split("/").filter(Boolean);
+  if (segs.some((s) => NOISE_SEGMENTS.has(s))) return true;
+  return false;
+}
+
 // Build sections { name, links: [{title, url}] } from sitemap entries.
 // entries: [{ loc, lastmod }]. Within a section, shallower (higher-level)
 // pages rank first; among comparable depths, fresher <lastmod> wins.
@@ -250,6 +270,7 @@ function groupUrls(entries, root) {
       if (path === "/" || path === "") home.push(u);
       continue;
     }
+    if (isNoiseUrl(u)) continue; // skip archives / pagination / assets
     if (!buckets.has(seg)) buckets.set(seg, []);
     buckets.get(seg).push(e);
   }
@@ -372,7 +393,7 @@ async function writeWithClaude({ brand, root, host, summary, sections, fetched }
       lines.push(`  - ${l.title} | ${l.url}${note ? ` | ${note.slice(0, 160)}` : ""}`);
     }
   }
-  const crawl = lines.join("\n").slice(0, 6000); // hard cap on input size
+  const crawl = lines.join("\n").slice(0, 16000); // hard cap on input size
 
   const prompt =
 `You are generating an llms.txt file for the website "${host}" following the llms.txt standard (https://llmstxt.org).
