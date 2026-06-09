@@ -85,6 +85,28 @@ function extractLocs(xml) {
   return locs;
 }
 
+// Pull { loc, lastmod } per <url> entry so we can rank by freshness.
+// lastmod is an epoch ms number (or 0 when absent/unparseable).
+function extractEntries(xml) {
+  const entries = [];
+  const re = /<url\b[\s\S]*?<\/url>/gi;
+  let block;
+  while ((block = re.exec(xml))) {
+    const seg = block[0];
+    const locM = seg.match(/<loc>\s*([^<\s][^<]*?)\s*<\/loc>/i);
+    if (!locM) continue;
+    const loc = decodeXmlEntities(locM[1].trim());
+    const lmM = seg.match(/<lastmod>\s*([^<\s][^<]*?)\s*<\/lastmod>/i);
+    let lastmod = 0;
+    if (lmM) {
+      const t = Date.parse(lmM[1].trim());
+      if (!Number.isNaN(t)) lastmod = t;
+    }
+    entries.push({ loc, lastmod });
+  }
+  return entries;
+}
+
 function decodeXmlEntities(s) {
   return s
     .replace(/&amp;/g, "&")
@@ -110,8 +132,8 @@ async function sitemapsFromRobots(root) {
   return out;
 }
 
-// Returns a flat, de-duped list of page URLs from the site's sitemap(s).
-async function collectSitemapUrls(root) {
+// Returns a flat, de-duped list of { loc, lastmod } from the site's sitemap(s).
+async function collectSitemapEntries(root) {
   const candidates = [
     root + "/sitemap.xml",
     root + "/sitemap_index.xml",
@@ -121,41 +143,47 @@ async function collectSitemapUrls(root) {
   for (const s of fromRobots) if (!candidates.includes(s)) candidates.unshift(s);
 
   const seen = new Set();
-  const pageUrls = [];
-  const indexQueue = [];
+  const entries = [];
+  const add = (e) => {
+    if (!seen.has(e.loc)) { seen.add(e.loc); entries.push(e); }
+  };
 
   // first pass: try candidate sitemaps until one parses
   let rootXml = null;
-  let rootUrl = null;
   for (const url of candidates) {
     const xml = await fetchText(url, { accept: "application/xml,text/xml,*/*" });
     if (xml && /<(urlset|sitemapindex)[\s>]/i.test(xml)) {
       rootXml = xml;
-      rootUrl = url;
       break;
     }
   }
   if (!rootXml) return [];
 
   if (looksLikeSitemapIndex(rootXml)) {
-    // child sitemaps — fetch up to a few, gather their <loc> page URLs
-    const children = extractLocs(rootXml).slice(0, 5);
+    // child sitemaps — fetch the freshest few, gather their <url> entries.
+    // Sort children by their own <lastmod> so we crawl recently-updated
+    // sections first when the index is larger than we'll read.
+    const childEntries = extractEntries(rootXml);
+    const children = (childEntries.length ? childEntries : extractLocs(rootXml).map((loc) => ({ loc, lastmod: 0 })))
+      .sort((a, b) => b.lastmod - a.lastmod)
+      .slice(0, 5)
+      .map((e) => e.loc);
     for (const child of children) {
       const xml = await fetchText(child, { accept: "application/xml,text/xml,*/*" });
       if (!xml) continue;
-      for (const loc of extractLocs(xml)) {
-        if (!seen.has(loc)) { seen.add(loc); pageUrls.push(loc); }
-        if (pageUrls.length >= 400) break;
+      for (const e of extractEntries(xml)) {
+        add(e);
+        if (entries.length >= 400) break;
       }
-      if (pageUrls.length >= 400) break;
+      if (entries.length >= 400) break;
     }
   } else {
-    for (const loc of extractLocs(rootXml)) {
-      if (!seen.has(loc)) { seen.add(loc); pageUrls.push(loc); }
-      if (pageUrls.length >= 400) break;
+    for (const e of extractEntries(rootXml)) {
+      add(e);
+      if (entries.length >= 400) break;
     }
   }
-  return pageUrls;
+  return entries;
 }
 
 // ---- group + rank URLs into sections -------------------------------------
@@ -206,12 +234,15 @@ function firstSegment(u) {
   }
 }
 
-// Build sections { name, links: [{title, url}] } from page URLs.
-function groupUrls(urls, root) {
+// Build sections { name, links: [{title, url}] } from sitemap entries.
+// entries: [{ loc, lastmod }]. Within a section, shallower (higher-level)
+// pages rank first; among comparable depths, fresher <lastmod> wins.
+function groupUrls(entries, root) {
   const home = [];
-  const buckets = new Map(); // segment -> urls
+  const buckets = new Map(); // segment -> entries
 
-  for (const u of urls) {
+  for (const e of entries) {
+    const u = e.loc;
     let path;
     try { path = new URL(u).pathname; } catch { continue; }
     const seg = firstSegment(u);
@@ -220,7 +251,7 @@ function groupUrls(urls, root) {
       continue;
     }
     if (!buckets.has(seg)) buckets.set(seg, []);
-    buckets.get(seg).push(u);
+    buckets.get(seg).push(e);
   }
 
   // sort buckets by size (most populated paths first), keep top N
@@ -231,23 +262,25 @@ function groupUrls(urls, root) {
   const sections = [];
   let total = 0;
 
-  for (const [seg, segUrls] of ordered) {
+  const depth = (u) => (u.match(/\//g) || []).length;
+
+  for (const [seg, segEntries] of ordered) {
     if (total >= MAX_TOTAL_LINKS) break;
-    // prefer shorter (higher-level) paths first, then alpha
-    const picked = segUrls
+    // shallower paths first, then most-recently-modified, then shorter URL
+    const picked = segEntries
       .slice()
       .sort((a, b) => {
-        const da = (a.match(/\//g) || []).length;
-        const db = (b.match(/\//g) || []).length;
+        const da = depth(a.loc), db = depth(b.loc);
         if (da !== db) return da - db;
-        return a.length - b.length;
+        if (b.lastmod !== a.lastmod) return b.lastmod - a.lastmod;
+        return a.loc.length - b.loc.length;
       })
       .slice(0, MAX_LINKS_PER_SECTION);
 
     const links = [];
-    for (const u of picked) {
+    for (const e of picked) {
       if (total >= MAX_TOTAL_LINKS) break;
-      links.push({ title: titleFromUrl(u), url: u });
+      links.push({ title: titleFromUrl(e.loc), url: e.loc });
       total++;
     }
     if (links.length) sections.push({ name: titleFromSegment(seg), links });
@@ -396,6 +429,22 @@ function rateLimited(key) {
   return rec.count > RATE.max;
 }
 
+// ---- reuse an existing /llms.txt -----------------------------------------
+// The single best signal: if the site already publishes one, prefer it.
+// Returns the file text if it looks like a real llms.txt, else null.
+async function fetchExistingLlmsTxt(root) {
+  const txt = await fetchText(root + "/llms.txt", { accept: "text/plain,text/markdown,*/*" });
+  if (!txt) return null;
+  const body = txt.trim();
+  // reject HTML error/SPA pages that some hosts serve as a 200 for /llms.txt
+  if (/<!doctype html|<html[\s>]/i.test(body)) return null;
+  // must contain a markdown H1 somewhere near the top (real files sometimes
+  // lead with a blockquote or a comment line before the H1)
+  if (!/^#\s+\S/m.test(body)) return null;
+  if (body.length < 20) return null;
+  return body.endsWith("\n") ? body : body + "\n";
+}
+
 // ---- handler --------------------------------------------------------------
 export default async function handler(req, res) {
   const raw =
@@ -420,15 +469,40 @@ export default async function handler(req, res) {
   }
 
   try {
-    const urls = await collectSitemapUrls(d.root);
+    // 1) If the site already publishes an /llms.txt, that's the best answer —
+    // return it directly rather than rebuilding from scratch.
+    const existing = await fetchExistingLlmsTxt(d.root);
+    if (existing) {
+      const linkCount = (existing.match(/^\s*-\s*\[[^\]]*\]\(/gm) || []).length;
+      const sectionCount = (existing.match(/^##\s+\S/gm) || []).length;
+      const h1 = existing.match(/^#\s+(.+)$/m);
+      res.setHeader("Cache-Control", "s-maxage=86400, stale-while-revalidate");
+      res.status(200).json({
+        simulated: false,
+        generatedBy: "existing",
+        text: existing,
+        meta: {
+          host: d.host,
+          brand: (h1 && h1[1].trim()) || d.brand,
+          root: d.root,
+          linkCount,
+          sectionCount,
+          pagesCrawled: 0,
+        },
+      });
+      return;
+    }
 
-    if (!urls.length) {
+    // 2) Otherwise crawl the sitemap and build one.
+    const entries = await collectSitemapEntries(d.root);
+
+    if (!entries.length) {
       // nothing to crawl — let the client fall back to the simulator
       res.status(200).json({ simulated: true, reason: "no_sitemap", meta: { host: d.host } });
       return;
     }
 
-    const { sections } = groupUrls(urls, d.root);
+    const { sections } = groupUrls(entries, d.root);
     if (!sections.length) {
       res.status(200).json({ simulated: true, reason: "no_sections", meta: { host: d.host } });
       return;
@@ -498,7 +572,7 @@ export default async function handler(req, res) {
         root: d.root,
         linkCount,
         sectionCount: sectionCount || sections.length,
-        pagesCrawled: urls.length,
+        pagesCrawled: entries.length,
       },
     });
   } catch (e) {
